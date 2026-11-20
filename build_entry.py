@@ -1,11 +1,11 @@
-"""Render entry.png: one newspaper front page for Friday 20 November 2026.
+"""Render entry.png: a newspaper front page for Friday 20 November 2026.
 
-Run:  python build_entry.py
-Out:  entry.png (1024x1024, PNG, well under 1 MiB)
+Run:   python build_entry.py [out.png]
+Out:   1024x1024 PNG, well under 1 MiB.
 
-The page is set like a broadsheet front page: a masthead, a lead ruling on the
-left, six short briefs in the grid, and a date block. Everything is drawn with
-Pillow, no network and no external assets.
+Everything is drawn with Pillow -- no network, no external assets. Each block is
+measured as it is laid out and the build stops with an error if a block would
+overflow its cell, so the committed image is a clean page and not a guess.
 """
 
 from __future__ import annotations
@@ -16,26 +16,29 @@ import sys
 from PIL import Image, ImageDraw, ImageFont
 
 W = H = 1024
-M = 36
+M = 40  # page margin
 
-PAPER = (243, 237, 225)
-SHADE = (219, 208, 188)
-INK = (20, 17, 14)
-RED = (176, 42, 31)
-RULE = (201, 191, 173)
-MUTED = (92, 82, 68)
-WHITE = (247, 242, 232)
+INK = (24, 20, 16)
+RED = (168, 44, 32)
+MUTED = (100, 90, 76)
+RULE = (196, 185, 165)
+FAINT = (214, 204, 186)
+WHITE = (251, 248, 242)
 
-FONT_DIRS = [r"C:\Windows\Fonts", "/usr/share/fonts/truetype/dejavu",
-             "/System/Library/Fonts/Supplemental", "/Library/Fonts"]
+FONT_DIRS = [
+    r"C:\Windows\Fonts",
+    "/usr/share/fonts/truetype/dejavu",
+    "/System/Library/Fonts/Supplemental",
+    "/Library/Fonts",
+]
 
-# role -> candidate file names, best first
+# role -> candidate files, best first
 FONT_FILES = {
-    "serif_bold": ["georgiab.ttf", "DejaVuSerif-Bold.ttf", "Times New Roman Bold.ttf", "timesbd.ttf"],
-    "serif": ["georgia.ttf", "DejaVuSerif.ttf", "times.ttf"],
+    "serif_bold": ["georgiab.ttf", "DejaVuSerif-Bold.ttf", "timesbd.ttf"],
+    "serif_italic": ["georgiai.ttf", "DejaVuSerif-Italic.ttf", "timesi.ttf"],
     "sans": ["segoeui.ttf", "DejaVuSans.ttf", "arial.ttf"],
-    "sans_semibold": ["seguisb.ttf", "DejaVuSans-Bold.ttf", "arialbd.ttf"],
     "sans_bold": ["segoeuib.ttf", "DejaVuSans-Bold.ttf", "arialbd.ttf"],
+    "sans_semibold": ["seguisb.ttf", "DejaVuSans-Bold.ttf", "arialbd.ttf"],
 }
 
 
@@ -45,45 +48,50 @@ def find_font_file(names: list[str]) -> str:
             path = os.path.join(folder, name)
             if os.path.isfile(path):
                 return path
-    raise SystemExit(f"no usable font for {names}; install one of them")
+    raise SystemExit(f"no usable font for {names}")
 
 
 FONT_PATHS = {role: find_font_file(names) for role, names in FONT_FILES.items()}
-_FONT_CACHE: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+_CACHE: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
 
 
 def font(role: str, size: int) -> ImageFont.FreeTypeFont:
     key = (role, size)
-    if key not in _FONT_CACHE:
-        _FONT_CACHE[key] = ImageFont.truetype(FONT_PATHS[role], size)
-    return _FONT_CACHE[key]
+    if key not in _CACHE:
+        _CACHE[key] = ImageFont.truetype(FONT_PATHS[role], size)
+    return _CACHE[key]
 
 
-# --- text measuring ---------------------------------------------------------
+# --- measuring --------------------------------------------------------------
 
-def tracked_width(draw: ImageDraw.ImageDraw, text: str, f: ImageFont.FreeTypeFont,
-                  tracking: float) -> float:
+def text_width(draw: ImageDraw.ImageDraw, text: str, f: ImageFont.FreeTypeFont,
+               tracking: float = 0.0) -> float:
     if not text:
         return 0.0
+    if tracking == 0.0:
+        return draw.textlength(text, font=f)
     return sum(draw.textlength(ch, font=f) for ch in text) + tracking * (len(text) - 1)
 
 
 def draw_tracked(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str,
                  f: ImageFont.FreeTypeFont, fill, tracking: float = 0.0) -> None:
     x, y = xy
+    if tracking == 0.0:
+        draw.text((x, y), text, font=f, fill=fill)
+        return
     for ch in text:
         draw.text((x, y), ch, font=f, fill=fill)
         x += draw.textlength(ch, font=f) + tracking
 
 
 def wrap(draw: ImageDraw.ImageDraw, text: str, f: ImageFont.FreeTypeFont,
-         max_width: float, tracking: float = 0.0) -> list[str]:
+         max_width: float) -> list[str]:
     lines: list[str] = []
     for paragraph in text.split("\n"):
         current = ""
         for word in paragraph.split():
             candidate = f"{current} {word}".strip()
-            if tracked_width(draw, candidate, f, tracking) <= max_width or not current:
+            if not current or text_width(draw, candidate, f) <= max_width:
                 current = candidate
             else:
                 lines.append(current)
@@ -93,123 +101,127 @@ def wrap(draw: ImageDraw.ImageDraw, text: str, f: ImageFont.FreeTypeFont,
     return lines
 
 
-def fit_serif(draw: ImageDraw.ImageDraw, text: str, max_width: float, max_height: float,
-              sizes: range, line_gap: float = 1.12, tracking: float = 0.0,
-              role: str = "serif_bold") -> tuple[ImageFont.FreeTypeFont, list[str], float]:
-    """Largest size whose wrapped block fits the box; smallest size as fallback."""
-    chosen = None
-    for size in sizes:
-        f = font(role, size)
-        lines = wrap(draw, text, f, max_width, tracking)
-        lh = size * line_gap
-        if all(tracked_width(draw, ln, f, tracking) <= max_width for ln in lines) \
-                and len(lines) * lh <= max_height:
-            chosen = (f, lines, lh)
-            break
-    if chosen is None:
-        size = sizes[-1]
-        f = font(role, size)
-        lines = wrap(draw, text, f, max_width, tracking)
-        chosen = (f, lines, size * line_gap)
-    return chosen
+def rule(draw: ImageDraw.ImageDraw, x0: float, y: float, x1: float,
+         color=RULE, weight: int = 1) -> None:
+    draw.rectangle([x0, y, x1, y + weight - 1], fill=color)
 
 
-# --- page furniture ---------------------------------------------------------
+def vrule(draw: ImageDraw.ImageDraw, x: float, y0: float, y1: float,
+          color=RULE, weight: int = 1) -> None:
+    draw.rectangle([x, y0, x + weight - 1, y1], fill=color)
 
-def paper_background() -> Image.Image:
-    img = Image.new("RGB", (W, H), PAPER)
-    # A soft, low-contrast vignette: enough to read as paper, cheap to compress.
-    small = Image.new("L", (64, 64))
-    px = small.load()
-    for y in range(64):
-        for x in range(64):
-            dx = (x - 31.5) / 31.5
-            dy = (y - 31.5) / 31.5
+
+def kicker(draw: ImageDraw.ImageDraw, x: float, y: float, num: str, label: str,
+           size: int, gap: float) -> None:
+    f = font("sans_bold", size)
+    draw_tracked(draw, (x, y), num, f, RED, 1.4)
+    nw = text_width(draw, num, f, 1.4)
+    draw_tracked(draw, (x + nw + gap, y), "/", f, RED)
+    fl = font("sans_semibold", size)
+    draw_tracked(draw, (x + nw + gap + 10, y + 1), label.upper(), fl, MUTED, 2.0)
+
+
+# --- page -------------------------------------------------------------------
+
+def paper() -> Image.Image:
+    """A vertical paper gradient plus a soft vignette: cheap and compressible."""
+    strip = Image.new("RGB", (1, H))
+    px = strip.load()
+    top, bottom = (250, 246, 238), (237, 229, 214)
+    for y in range(H):
+        t = y / (H - 1)
+        px[0, y] = tuple(round(top[i] + (bottom[i] - top[i]) * t) for i in range(3))
+    base = strip.resize((W, H), Image.BILINEAR)
+
+    mask = Image.new("L", (96, 96))
+    mp = mask.load()
+    for y in range(96):
+        for x in range(96):
+            dx = (x - 47.5) / 47.5
+            dy = (y - 47.5) / 47.5
             r = min(1.0, (dx * dx + dy * dy) ** 0.5)
-            px[x, y] = int(max(0.0, (r - 0.45) / 0.55) * 30)
-    vig = small.resize((W, H), Image.BICUBIC)
-    return Image.composite(Image.new("RGB", (W, H), SHADE), img, vig)
+            mp[x, y] = int(max(0.0, (r - 0.5) / 0.5) * 24)
+    shade = Image.new("RGB", (W, H), (226, 216, 198))
+    return Image.composite(shade, base, mask.resize((W, H), Image.BICUBIC))
 
 
-def kicker(draw: ImageDraw.ImageDraw, x: float, y: float, num: str, label: str) -> None:
-    f_num = font("sans_bold", 12)
-    f_lab = font("sans_semibold", 10)
-    draw_tracked(draw, (x, y), num, f_num, RED, 1.2)
-    nw = tracked_width(draw, num, f_num, 1.2)
-    draw_tracked(draw, (x + nw + 9, y + 1), "/", f_num, RED, 0.0)
-    draw_tracked(draw, (x + nw + 22, y + 2), label.upper(), f_lab, MUTED, 2.0)
+# --- blocks -----------------------------------------------------------------
 
+def lead(draw: ImageDraw.ImageDraw, x: float, y: float, w: float, h: float,
+         num: str, label: str, headline: str, deck: str) -> None:
+    rule(draw, x, y, x + w - 1, RED, 3)
+    kicker(draw, x, y + 20, num, label, 11, 10)
 
-# --- cells ------------------------------------------------------------------
+    deck_f = font("serif_italic", 19)
+    deck_lines = wrap(draw, deck, deck_f, w)
+    if len(deck_lines) > 3:
+        raise SystemExit(f"lead deck wraps to {len(deck_lines)} lines")
+    deck_lh = 25
 
-def brief(draw, x, y, w, h, num, label, headline, deck) -> None:
-    draw.rectangle([x, y, x + w - 1, y], fill=RULE)
+    top = y + 54
+    avail = h - (top - y) - len(deck_lines) * deck_lh - 18
+    size = None
+    for candidate in range(56, 29, -2):
+        f = font("serif_bold", candidate)
+        lines = wrap(draw, headline, f, w)
+        if len(lines) * candidate * 1.06 <= avail:
+            size = candidate
+            break
+    if size is None:
+        raise SystemExit("lead headline does not fit")
+    f = font("serif_bold", size)
+    lines = wrap(draw, headline, f, w)
+    lh = size * 1.06
 
-    deck_f = font("sans", 14)
-    deck_lines = wrap(draw, deck, deck_f, w)[:3]
-    deck_lh = 17.5
-
-    top_min = 11
-    avail = h - 34 - len(deck_lines) * deck_lh - 12
-    hf, lines, lh = fit_serif(draw, headline, w, avail,
-                              range(27, 16, -1), line_gap=1.10)
-
-    top = y + top_min
-
-    kicker(draw, x, top, num, label)
-    ty = top + 34
-    for line in lines:
-        draw.text((x, ty), line, font=hf, fill=INK)
-        ty += lh
-    ty += 8
-    draw.rectangle([x, ty, x + 26, ty + 2], fill=RED)
-    ty += 10
-    for line in deck_lines:
-        draw.text((x, ty), line, font=deck_f, fill=MUTED)
-        ty += deck_lh
-
-
-def lead(draw, x, y, w, h, num, label, headline, deck) -> None:
-    draw.rectangle([x, y, x + w - 1, y + 3], fill=RED)
-    kicker(draw, x, y + 16, num, label)
-
-    deck_f = font("sans", 14)
-    deck_lines = wrap(draw, deck, deck_f, w)[:4]
-    deck_lh = 19
-    deck_h = len(deck_lines) * deck_lh
-
-    top = y + 44
-    avail = h - 44 - deck_h - 22
-    hf, lines, lh = fit_serif(draw, headline, w, avail,
-                              range(58, 26, -2), line_gap=1.08)
     ty = top
     for line in lines:
-        draw.text((x, ty), line, font=hf, fill=INK)
+        draw.text((x - 2, ty), line, font=f, fill=INK)
         ty += lh
-    ty += 8
-    draw.rectangle([x, ty, x + w - 1, ty + 1], fill=RULE)
-    ty += 12
+    ty += 6
+    rule(draw, x, ty, x + 116, RED, 2)
+    ty += 15
     for line in deck_lines:
         draw.text((x, ty), line, font=deck_f, fill=MUTED)
         ty += deck_lh
+    if ty > y + h + 1:
+        raise SystemExit(f"lead overflows by {ty - (y + h):.1f}px")
 
 
-def date_block(draw, x, y, w, h) -> None:
+def brief(draw: ImageDraw.ImageDraw, x: float, y: float, w: float, h: float,
+          size: int, num: str, label: str, headline: str, deck: str) -> None:
+    rule(draw, x, y, x + w - 1, RULE, 1)
+    kicker(draw, x, y + 15, num, label, 9, 7)
+
+    f = font("serif_bold", size)
+    lines = wrap(draw, headline, f, w)
+    lh = size * 1.10
+
+    deck_f = font("sans", 14)
+    deck_lines = wrap(draw, deck, deck_f, w)
+    deck_lh = 19
+
+    ty = y + 46
+    for line in lines:
+        draw.text((x, ty), line, font=f, fill=INK)
+        ty += lh
+    ty += 9
+    for line in deck_lines:
+        draw.text((x, ty), line, font=deck_f, fill=MUTED)
+        ty += deck_lh
+    if ty > y + h + 1:
+        raise SystemExit(f"brief {num} overflows by {ty - (y + h):.1f}px")
+
+
+def date_panel(draw: ImageDraw.ImageDraw, x: float, y: float, w: float, h: float) -> None:
     draw.rectangle([x, y, x + w - 1, y + h - 1], fill=INK)
-    pad = 18
-    f_top = font("sans_semibold", 10)
-    draw_tracked(draw, (x + pad, y + 16), "FRIDAY", f_top, RED, 3.0)
-
-    big = font("serif_bold", 92)
-    draw.text((x + pad - 5, y + 30), "20", font=big, fill=WHITE)
-
-    f_month = font("serif_bold", 24)
-    draw.text((x + pad, y + 130), "NOV 2026", font=f_month, fill=WHITE)
-
-    draw.rectangle([x + pad, y + h - 46, x + w - pad, y + h - 45], fill=RED)
-    f_foot = font("sans_semibold", 9)
-    draw_tracked(draw, (x + pad, y + h - 36), "SEVEN STORIES", f_foot, WHITE, 2.0)
-    draw_tracked(draw, (x + pad, y + h - 22), "ONE PAGE", f_foot, RED, 2.0)
+    pad = 20
+    draw_tracked(draw, (x + pad, y + 18), "FRIDAY", font("sans_semibold", 9), RED, 3.6)
+    draw.text((x + pad - 4, y + 34), "20", font=font("serif_bold", 80), fill=WHITE)
+    draw.text((x + pad, y + 142), "NOVEMBER 2026", font=font("serif_bold", 24), fill=WHITE)
+    rule(draw, x + pad, y + 176, x + w - pad, RED, 2)
+    ff = font("sans_semibold", 8)
+    draw_tracked(draw, (x + pad, y + 188), "SEVEN STORIES", ff, WHITE, 2.2)
+    draw_tracked(draw, (x + pad, y + 204), "ONE FRONT PAGE", ff, (200, 122, 110), 2.2)
 
 
 # --- content ----------------------------------------------------------------
@@ -217,79 +229,107 @@ def date_block(draw, x, y, w, h) -> None:
 STORIES = [
     ("01", "World",
      "ICJ: Myanmar committed genocide against Rohingya",
-     "The court's ruling closes a case\nyears in the making."),
+     "The court finds the 2017 campaign amounted to genocide."),
     ("02", "Asia-Pacific",
      "Trump, Xi and Putin in first three-way summit as APEC closes in Shenzhen",
-     "Three leaders at one table as the summit ends."),
+     "Three leaders share one stage as the summit closes."),
     ("03", "Markets",
      "Anthropic IPO debut",
-     "The company's shares begin trading in public."),
+     "Shares begin trading in the AI company's public debut."),
     ("04", "Climate",
      "COP31 ends, fossil-fuel transition text cut",
      "Talks close with the transition text weakened."),
     ("05", "Europe",
      "Putin rules out sea and energy truce after Crimea Bridge hit again",
-     "Moscow rules out a truce at sea and on energy."),
+     "Moscow refuses a truce at sea or on energy targets."),
     ("06", "Middle East",
      "Iran steps up Hormuz tanker attacks",
-     "Tanker attacks in the strait are stepping up."),
+     "Attacks on shipping in the strait intensify."),
     ("07", "Middle East",
      "Gaza: 65,000 tents wait at border",
-     "Shelters wait at the border, nowhere to go."),
+     "Shelters pile up at the crossing with nowhere to go."),
 ]
+
+TITLE = "WORLD NEWS - 20 NOV 2026"
+
+# grid: three 300px columns, 22px gutters, 944px of content
+COL_W, GUT = 300, 22
+COLS = [M, M + COL_W + GUT, M + 2 * (COL_W + GUT)]
+ROWS = [200, 458, 716]
+ROW_H, LEAD_H = 232, 490
+
+
+def brief_size(draw: ImageDraw.ImageDraw, w: float, h: float) -> int:
+    """One headline size for every brief, so the grid reads as a single design."""
+    for size in range(27, 17, -1):
+        ok = True
+        for _, _, head, deck in STORIES[1:]:
+            f = font("serif_bold", size)
+            if len(wrap(draw, head, f, w)) * size * 1.10 > h - 46 - 9 - 19 * 2:
+                ok = False
+                break
+        if ok:
+            return size
+    raise SystemExit("no uniform brief size fits")
 
 
 def main() -> None:
     out = sys.argv[1] if len(sys.argv) > 1 else "entry.png"
-    img = paper_background()
+    img = paper()
     draw = ImageDraw.Draw(img)
 
+    # top strap
+    fs = font("sans_semibold", 9)
+    draw_tracked(draw, (M, 28), "THE WORLD IN ONE PAGE", fs, RED, 3.2)
+    right = "LATE EDITION  /  NO. 20"
+    draw_tracked(draw, (W - M - text_width(draw, right, fs, 3.2), 28), right, fs, MUTED, 3.2)
+    rule(draw, M, 48, W - M - 1, FAINT, 1)
+
     # masthead
-    draw.rectangle([M, 30, W - M - 1, 30], fill=RULE)
-    title = "WORLD NEWS - 20 NOV 2026"
-    tf, tlines, _ = fit_serif(draw, title, W - 2 * M - 18, 80, range(76, 40, -2),
-                              line_gap=1.0, tracking=-1.0)
-    tw = tracked_width(draw, title, tf, -1.0)
-    draw_tracked(draw, ((W - tw) / 2, 44), title, tf, INK, -1.0)
+    size = None
+    for candidate in range(84, 39, -2):
+        f = font("serif_bold", candidate)
+        if text_width(draw, TITLE, f, -1.6) <= W - 2 * M:
+            size = candidate
+            break
+    if size is None:
+        raise SystemExit("title does not fit")
+    tf = font("serif_bold", size)
+    tw = text_width(draw, TITLE, tf, -1.6)
+    draw_tracked(draw, ((W - tw) / 2, 62), TITLE, tf, INK, -1.6)
 
-    draw.rectangle([M, 128, W - M - 1, 131], fill=INK)
-    draw.rectangle([M, 137, W - M - 1, 137], fill=RULE)
-
+    rule(draw, M, 158, W - M - 1, INK, 4)
+    rule(draw, M, 166, W - M - 1, RULE, 1)
     f_strip = font("sans_semibold", 9)
-    draw_tracked(draw, (M, 149), "THE DAY IN SEVEN STORIES", f_strip, MUTED, 2.4)
-    right = "LATE EDITION / PAGE 01"
-    rw = tracked_width(draw, right, f_strip, 2.4)
-    draw_tracked(draw, (W - M - rw, 149), right, f_strip, MUTED, 2.4)
+    draw_tracked(draw, (M, 176), "THE DAY IN SEVEN STORIES", f_strip, MUTED, 2.6)
+    right = "FRIDAY 20 NOVEMBER 2026"
+    draw_tracked(draw, (W - M - text_width(draw, right, f_strip, 2.6), 176),
+                 right, f_strip, MUTED, 2.6)
 
-    # grid
-    col_w, gut = 300, 26
-    cols = [M, M + col_w + gut, M + 2 * (col_w + gut)]
-    rows = [180, 458, 736]
-    row_h, row_gap = 232, 46
+    # column rules
+    for boundary in (COLS[1] - GUT // 2, COLS[2] - GUT // 2):
+        vrule(draw, boundary, ROWS[0], ROWS[2] + ROW_H, FAINT, 1)
 
-    # column rules: the page is set in three columns
-    for boundary in (cols[1] - gut // 2, cols[2] - gut // 2):
-        draw.rectangle([boundary, rows[0], boundary, rows[2] + row_h], fill=RULE)
-
-    lead(draw, cols[0], rows[0], col_w, row_h * 2 + row_gap, *STORIES[0])
-    brief(draw, cols[1], rows[0], col_w, row_h, *STORIES[1])
-    brief(draw, cols[2], rows[0], col_w, row_h, *STORIES[2])
-    brief(draw, cols[1], rows[1], col_w, row_h, *STORIES[3])
-    brief(draw, cols[2], rows[1], col_w, row_h, *STORIES[4])
-    brief(draw, cols[0], rows[2], col_w, row_h, *STORIES[5])
-    brief(draw, cols[1], rows[2], col_w, row_h, *STORIES[6])
-    date_block(draw, cols[2], rows[2], col_w, row_h)
+    bsize = brief_size(draw, COL_W, ROW_H)
+    lead(draw, COLS[0], ROWS[0], COL_W, LEAD_H, *STORIES[0])
+    brief(draw, COLS[1], ROWS[0], COL_W, ROW_H, bsize, *STORIES[1])
+    brief(draw, COLS[2], ROWS[0], COL_W, ROW_H, bsize, *STORIES[2])
+    brief(draw, COLS[1], ROWS[1], COL_W, ROW_H, bsize, *STORIES[3])
+    brief(draw, COLS[2], ROWS[1], COL_W, ROW_H, bsize, *STORIES[4])
+    brief(draw, COLS[0], ROWS[2], COL_W, ROW_H, bsize, *STORIES[5])
+    brief(draw, COLS[1], ROWS[2], COL_W, ROW_H, bsize, *STORIES[6])
+    date_panel(draw, COLS[2], ROWS[2], COL_W, ROW_H)
 
     # footer
-    draw.rectangle([M, 982, W - M - 1, 982], fill=RULE)
-    f_foot = font("sans", 9)
-    draw_tracked(draw, (M, 991), "20 NOVEMBER 2026 / WORLD NEWS IN ONE PAGE", f_foot, MUTED, 1.6)
+    rule(draw, M, 966, W - M - 1, FAINT, 1)
+    ff = font("sans", 9)
+    draw_tracked(draw, (M, 974), "20 NOVEMBER 2026  /  WORLD NEWS IN ONE PAGE", ff, MUTED, 1.6)
     right = "EDITED FOR ONE PAGE"
-    rw = tracked_width(draw, right, f_foot, 1.6)
-    draw_tracked(draw, (W - M - rw, 991), right, f_foot, MUTED, 1.6)
+    draw_tracked(draw, (W - M - text_width(draw, right, ff, 1.6), 974), right, ff, MUTED, 1.6)
 
     img.save(out, "PNG", optimize=True)
-    print(f"wrote {out} {img.size[0]}x{img.size[1]} {os.path.getsize(out)} bytes")
+    print(f"wrote {out} {img.size[0]}x{img.size[1]} "
+          f"{os.path.getsize(out)} bytes, brief size {bsize}px")
 
 
 if __name__ == "__main__":
